@@ -1,3 +1,6 @@
+/// \file ecs.hh
+/// The whole implementation of the ECS in a single header file.
+
 #pragma once
 
 #include <algorithm>
@@ -37,10 +40,31 @@
 
 #include "ecs_hooks.hh"
 
+#ifndef ECS_COMPONENT_TYPE
+#define ECS_COMPONENT_TYPE uint8_t
+#endif
+
+#ifndef ECS_MAX_COMPONENTS
+#define ECS_MAX_COMPONENTS 128
+#endif
+
 namespace ecs {
 
+/// Indicates that a query must have the component `T`. The query will only
+/// contain entities that have `T`. This is better than using a reference to `T`
+/// in the query if access to the component data is not required.
+/// \tparam T The component that must be present.
 template <typename T> struct With {};
+
+/// Indicates that a query must not have the component `T`. The query will not
+/// contain any entities that have `T`.
+/// \tparam T The component that must not be present.
 template <typename T> struct Without {};
+
+/// Used in a query to check for the presence of a component `T`. It can be cast
+/// to a boolean value. This is better than using a pointer to `T` in the query
+/// if access to the component data is not required.
+/// \tparam T The component to check.
 template <typename T> struct Has {
   explicit Has(bool value) : value(value) {}
   explicit operator bool() const { return value; }
@@ -48,12 +72,21 @@ template <typename T> struct Has {
   bool value;
 };
 
+/// An `Entity` is just an ID.
 using Entity = uint64_t;
-using ComponentType = uint8_t;
 
-constexpr ComponentType MAX_COMPONENTS = 128;
+/// The type for a component type ID. It can be changed by defining
+/// `ECS_COMPONENT_TYPE`. By default, it is `uint8_t`.
+using ComponentType = ECS_COMPONENT_TYPE;
 
+/// THe maximum number of types of components that can be registered. It can be
+/// changed by defining `ECS_MAX_COMPONENTS`. By default, it is 128.
+constexpr ComponentType MAX_COMPONENTS = ECS_MAX_COMPONENTS;
+
+/// The priority of a message logged by the ECS.
 enum class LogPriority : uint8_t { Verbose, Info, Warning, Error };
+
+/// The type of function callback used by the ECS for logging.
 using LogFn = std::function<void(LogPriority, const std::string &)>;
 
 class Ecs;
@@ -78,8 +111,7 @@ template <typename T> inline std::string type_name() {
 }
 
 inline size_t thread_count() {
-  size_t count = std::thread::hardware_concurrency();
-  return count == 0 ? 4 : count;
+  return std::max(std::thread::hardware_concurrency(), 1u);
 }
 
 template <typename... Ts> struct is_contained;
@@ -370,70 +402,6 @@ struct SystemLayer {
   std::vector<bool> conditions_fulfilled;
 };
 
-template <bool Layered = true> class SystemHandle {
-  friend class ecs::Ecs;
-
-public:
-  SystemHandle &on_main_thread(bool value = true) {
-    for (auto [id, sys] : systems) { sys->on_main_thread = value; }
-    return *this;
-  }
-
-  SystemHandle &run_if(SystemCondition auto &&fn) {
-    for (auto [id, sys] : systems) { sys->conditions.push_back(fn); }
-    return *this;
-  }
-
-  SystemHandle &in_group(size_t group) requires Layered {
-    for (auto [id, sys] : systems) { layer.system_groups[group].push_back(id); }
-    return *this;
-  }
-
-  SystemHandle &after(SystemFn auto &&fn) requires Layered {
-    for (auto [id, sys] : systems) {
-      layer.dependency_graph.add_edge(get_system_id(fn), id);
-    }
-
-    return *this;
-  }
-
-  SystemHandle &before(SystemFn auto &&fn) requires Layered {
-    for (auto [id, sys] : systems) {
-      layer.dependency_graph.add_edge(id, get_system_id(fn));
-    }
-
-    return *this;
-  }
-
-  SystemHandle &after(size_t group) requires Layered {
-    for (auto [id, sys] : systems) {
-      layer.group_dependencies.after[id].push_back(group);
-    }
-
-    return *this;
-  }
-
-  SystemHandle &before(size_t group) requires Layered {
-    for (auto [id, sys] : systems) {
-      layer.group_dependencies.before[id].push_back(group);
-    }
-
-    return *this;
-  }
-
-private:
-  using LayerType = std::conditional_t<Layered, SystemLayer &, std::monostate>;
-
-  SystemHandle(LayerType layer) requires Layered : layer(layer) {}
-  SystemHandle() requires(!Layered) {}
-
-  SystemHandle(const SystemHandle &) = delete;
-  SystemHandle(SystemHandle &&) = default;
-
-  LayerType layer;
-  std::vector<std::pair<uint64_t, ISystem *>> systems{};
-};
-
 template <SystemArgs... Args> class System : public ISystem {
 public:
   System(std::function<void(Args...)> &&fn,
@@ -469,12 +437,106 @@ struct Resource {
   bool read_main_thread_only{}, write_main_thread_only{};
 };
 
+} // namespace detail
+
+template <bool Layered = true> class SystemHandle {
+  friend class ecs::Ecs;
+
+public:
+  /// Specifies whether the systems must be run on the main thread.
+  /// \param value Whether to run on the main thread or not.
+  SystemHandle &on_main_thread(bool value = true) {
+    for (auto [id, sys] : systems) { sys->on_main_thread = value; }
+    return *this;
+  }
+
+  /// Adds a condition to the systems. A condition is a callable which takes a
+  /// reference to `Ecs` and returns a boolean.
+  /// \param fn The condition function.
+  SystemHandle &run_if(detail::SystemCondition auto &&fn) {
+    for (auto [id, sys] : systems) { sys->conditions.push_back(fn); }
+    return *this;
+  }
+
+  /// Makes the system a part of the given group.
+  /// \param group The group index.
+  SystemHandle &in_group(size_t group) requires Layered {
+    for (auto [id, sys] : systems) { layer.system_groups[group].push_back(id); }
+    return *this;
+  }
+
+  /// Adds a dependency to run the systems represented by the handle after the
+  /// given system.
+  /// \param fn The system to run after.
+  SystemHandle &after(detail::SystemFn auto &&fn) requires Layered {
+    for (auto [id, sys] : systems) {
+      layer.dependency_graph.add_edge(detail::get_system_id(fn), id);
+    }
+
+    return *this;
+  }
+
+  /// Adds a dependency to run the systems represented by the handle before the
+  /// given system.
+  /// \param fn The system to run before.
+  SystemHandle &before(detail::SystemFn auto &&fn) requires Layered {
+    for (auto [id, sys] : systems) {
+      layer.dependency_graph.add_edge(id, get_system_id(fn));
+    }
+
+    return *this;
+  }
+
+  /// Adds a dependency to run the systems represented by the handle after the
+  /// given group.
+  /// \param group The group to run after.
+  SystemHandle &after(size_t group) requires Layered {
+    for (auto [id, sys] : systems) {
+      layer.group_dependencies.after[id].push_back(group);
+    }
+
+    return *this;
+  }
+
+  /// Adds a dependency to run the systems represented by the handle before the
+  /// given group.
+  /// \param group The group to run before.
+  SystemHandle &before(size_t group) requires Layered {
+    for (auto [id, sys] : systems) {
+      layer.group_dependencies.before[id].push_back(group);
+    }
+
+    return *this;
+  }
+
+private:
+  using LayerType =
+      std::conditional_t<Layered, detail::SystemLayer &, std::monostate>;
+
+  SystemHandle(LayerType layer) requires Layered : layer(layer) {}
+  SystemHandle() requires(!Layered) {}
+
+  SystemHandle(const SystemHandle &) = delete;
+  SystemHandle(SystemHandle &&) = default;
+
+  LayerType layer;
+  std::vector<std::pair<uint64_t, detail::ISystem *>> systems{};
+};
+
 template <typename T> class ResourceHandle {
   friend class ecs::Ecs;
 
 public:
+  /// Gives a reference to the resource value.
+  /// \return A reference to the stored resource.
   T &get_value() { return *static_cast<T *>(resource.ptr.get()); }
 
+  /// Indicates that a resource may only be accessed on the main thread. Any
+  /// systems that access this will be forced to run on the main thread.
+  /// \param read Whether the resource must be read on the main thread (false by
+  /// default).
+  /// \param write Whether the resource must be written to on the main thread
+  /// (true by default).
   ResourceHandle &main_thread_only(bool read = false, bool write = true) {
     resource.read_main_thread_only = read;
     resource.write_main_thread_only = write;
@@ -482,23 +544,34 @@ public:
   }
 
 private:
-  ResourceHandle(Resource &resource) : resource(resource) {}
+  ResourceHandle(detail::Resource &resource) : resource(resource) {}
 
-  Resource &resource;
+  detail::Resource &resource;
 };
 
 class EntityHandle {
+  friend class EntityRange;
+
 public:
-  explicit EntityHandle(Ecs &ecs, Entity e) : ecs(ecs), entity(e) {}
+  /// Returns the ID of the entity.
+  /// \return The entity ID.
   auto id() { return entity; }
+
+  /// Gives a view to all of the components of this entity in a type-erased
+  /// manner. The view consists of tuples for each component in the form:
+  /// `(type_index, name, void_ptr_to_component_data)`
   auto get_components();
 
 private:
+  explicit EntityHandle(Ecs &ecs, Entity e) : ecs(ecs), entity(e) {}
+
   Ecs &ecs;
   Entity entity;
 };
 
 class EntityRange {
+  friend class Ecs;
+
   struct Iterator {
     using iterator_category = std::input_iterator_tag;
     using value_type = EntityHandle;
@@ -542,27 +615,31 @@ class EntityRange {
   };
 
 public:
-  EntityRange(Ecs &ecs);
   Iterator begin();
   Iterator end();
 
 private:
+  EntityRange(Ecs &ecs);
+
   Ecs &ecs;
   std::vector<std::pair<size_t, Entity *>> entity_arrays;
-  std::vector<Archetype *> archetypes;
+  std::vector<detail::Archetype *> archetypes;
 };
 
-} // namespace detail
-
+/// The main class for the ECS.
 class Ecs {
   template <detail::SystemArgs...> friend class detail::System;
   template <detail::SystemArg> friend struct detail::GetSystemArg;
   template <detail::QueryArgs...> friend class Query;
   friend class Commands;
-  friend class detail::EntityRange;
-  friend class detail::EntityHandle;
+  friend class EntityRange;
+  friend class EntityHandle;
 
 public:
+  /// The constructor takes an optional logging callback. If none is provided,
+  /// an empty no-op one will be used. The ECS thread pool is also created in
+  /// the constructor.
+  /// \param log_fn The logging callback.
   Ecs(const LogFn &log_fn = {}) : log(log_fn) {
     thread_pool.reserve(detail::thread_count());
     for (size_t i = 0; i < detail::thread_count(); i++) {
@@ -572,6 +649,7 @@ public:
     }
   }
 
+  /// The destructor cleans up the thread pool.
   ~Ecs() {
     {
       std::lock_guard lock(layer_mutex);
@@ -582,13 +660,29 @@ public:
     for (auto &thread : thread_pool) thread.join();
   }
 
+  /// Adds a "package" to the `Ecs`. A package is any `struct` containing a
+  /// static function `setup` that takes a reference to an `Ecs` instance along
+  /// with any number of custom arguments. `add_package<P>(args...)` is
+  /// basically syntax sugar for `P::setup(ecs, args...)`.
+  /// \tparam P The type of the package to add.
+  /// \tparam Args... The types of the additional arguments to be given to the
+  /// package setup function.
+  /// \param args The additional arguments to be given to the package setup
+  /// function.
   template <typename P, typename... Args> requires detail::Package<P, Args...>
   void add_package(Args &&...args) {
     P::setup(*this, std::forward<Args>(args)...);
   }
 
-  std::string get_state() { return current_state; }
+  /// Returns the current state of the ECS.
+  /// \return The current state.
+  const std::string &get_state() const { return current_state; }
 
+  /// Sets the names of all possible states in the ECS. This can only be called
+  /// once to initialize all states. It should not be called with no arguments,
+  /// as that has no effect.
+  /// \param state_names The names of all of the states as values convertible
+  /// to `std::string`. None of these should be empty or "Null".
   void
   set_states(std::convertible_to<const std::string &> auto &&...state_names) {
     if constexpr (sizeof...(state_names) == 0) {
@@ -630,6 +724,11 @@ public:
     }
   }
 
+  /// Queues a state change for the ECS. The actual state change occurs on the
+  /// next `Ecs::run_systems()` call. Note that if more than one state change
+  /// occurs before they get a chance to actually be executed, only the last one
+  /// will be considered.
+  /// \param state The state to change to.
   void change_state(const std::string &state) {
     if (state == current_state || state == next_state) return;
 
@@ -642,10 +741,16 @@ public:
     next_state = state;
   }
 
+  /// Tells if a component is registered in the ECS.
+  /// \tparam T The component to check.
+  /// \return Whether the component is registered.
   template <typename T> bool is_component_registered() const {
     return component_types.contains(typeid(T));
   }
 
+  /// Returns the `ComponentType` ID of a component.
+  /// \tparam T The component whose type ID is needed.
+  /// \return The type ID of the component.
   template <typename T> ComponentType get_component_type() const {
     if (!is_component_registered<T>()) {
       log.fatal("Attempted to access unregistered component {}",
@@ -655,6 +760,10 @@ public:
     return component_types.at(typeid(T));
   }
 
+  /// Returns a pair of the name and type index of the component indicated by
+  /// the given `ComponentType` ID.
+  /// \param type The type ID of the component.
+  /// \return The name and type index of the component.
   std::pair<std::string, std::type_index>
   get_component_type_info(ComponentType type) const {
     if (!component_type_indices.contains(type)) {
@@ -664,6 +773,8 @@ public:
     return {components[type].name, component_type_indices.at(type)};
   }
 
+  /// Registers `T` as a component for use in the ECS.
+  /// \tparam T The component to register.
   template <typename T> void register_component() {
     if (next_component_type + 1 >= MAX_COMPONENTS) {
       log.fatal("Attempted to register too many components");
@@ -697,22 +808,32 @@ public:
     hooks::on_register_component<T>(*this);
   }
 
+  /// Registers `Ts...` as components for use in the ECS.
+  /// \tparam Ts... The components to register.
   template <typename... Ts> void register_components() {
     (register_component<Ts>(), ...);
   }
 
+  /// Tells if a given resource is present in the ECS.
+  /// \tparam T The resource to check.
+  /// \return Whether the resource is present.
   template <typename T> bool has_resource() const {
     return resources.contains(typeid(T));
   }
 
+  /// Adds a resource to the ECS.
+  /// \tparam T The type of the resource to add.
+  /// \tparam Args... The types of the arguments to pass to the constructor of
+  /// `T`
+  /// \param args The arguments to pass to the constructor of `T`
   template <typename T, typename... Args>
   requires std::constructible_from<T, Args...>
-  detail::ResourceHandle<T> add_resource(Args &&...args) {
+  ResourceHandle<T> add_resource(Args &&...args) {
     if (has_resource<T>()) {
       log.error("Attempted to register already registered resource {}",
                 detail::type_name<T>());
 
-      return detail::ResourceHandle<T>{resources.at(typeid(T))};
+      return ResourceHandle<T>{resources.at(typeid(T))};
     }
 
     resources.emplace(typeid(T), detail::Resource{detail::make_unique_void<T>(
@@ -721,13 +842,20 @@ public:
     log.verbose("Registered resource {}", detail::type_name<T>());
 
     hooks::on_add_resource<T>(*this);
-    return detail::ResourceHandle<T>{resources.at(typeid(T))};
+    return ResourceHandle<T>{resources.at(typeid(T))};
   }
 
+  /// Returns a pointer to the resource of type `T`.
+  /// \tparam T The resource type to get.
+  /// \return A pointer to the resource.
   template <typename T> T *get_resource() {
     return static_cast<T *>(get_resource_internal<T>().ptr.get());
   }
 
+  /// Spawns an entity with the given components.
+  /// \tparam Ts... The types of the components to add to the entity.
+  /// \param components The values of the components to add to the entity.
+  /// \return The ID of the entity.
   template <typename... Ts> Entity spawn(Ts &&...components) {
     Entity entity = next_entity++;
     records[entity] = detail::Record{};
@@ -735,10 +863,14 @@ public:
     return entity;
   }
 
+  /// Removes all entities given by the provided range.
+  /// \param entities A range of entity IDs.
   void remove_entities(std::ranges::range auto &&entities) {
     for (auto e : entities) remove_entity(e);
   }
 
+  /// Removes the given entity from the ECS.
+  /// \param entity The ID of the entity to remove.
   void remove_entity(Entity entity) {
     if (!records.contains(entity)) {
       log.error("Attempted to remove invalid entity {}", entity);
@@ -760,12 +892,22 @@ public:
     records.erase(entity);
   }
 
+  /// Adds the given components to the provided entity.
+  /// \tparam Ts... The types of the components to add.
+  /// \param entity The ID of the entity to which the components will be added.
+  /// \param components The values of the components to add.
   template <typename... Ts>
   void add_components(Entity entity, Ts &&...components) {
     (add_component<Ts>(entity, std::move(components)), ...);
   }
 
+  /// Adds the given component to the provided entity.
+  /// \tparam T The type of the component to add.
+  /// \tparam Args... The types of the arguments to `T`'s constructor.
+  /// \param entity The ID of the entity to which the component will be added.
+  /// \param args The arguments to `T`'s constructor.
   template <typename T, typename... Args>
+  requires std::constructible_from<T, Args...>
   void add_component(Entity entity, Args &&...args) {
     if (!is_component_registered<T>()) {
       log.fatal("Attempted to add unregistered component {}",
@@ -817,14 +959,26 @@ public:
     new_archetype->entities.push_back(entity);
   }
 
+  /// Removes the given components from the provided entity.
+  /// \tparam Ts... The types of the components to remove.
+  /// \param entity The ID of the entity from which the components will be
+  /// removed.
   template <typename... Ts> void remove_components(Entity entity) {
     (remove_component<Ts>(entity), ...);
   }
 
+  /// Removes the given component from the provided entity.
+  /// \tparam T The type of the component to remove.
+  /// \param entity The ID of the entity from which the components will be
+  /// removed.
   template <typename T> void remove_component(Entity entity) {
     remove_component(entity, typeid(T));
   }
 
+  /// Removes the given component from the provided entity.
+  /// \param entity The ID of the entity from which the components will be
+  /// removed.
+  /// \param type_id The type index of the component to remove.
   void remove_component(Entity entity, std::type_index type_id) {
     if (!component_types.contains(type_id)) {
       log.fatal("Attempted to remove unregistered component {}",
@@ -866,11 +1020,15 @@ public:
     new_archetype->entities.push_back(entity);
   }
 
+  /// Registers layers with the given names for use with the ECS systems.
+  /// \param layer_names The names of the layers to register.
   void register_layers(
       std::convertible_to<const std::string &> auto &&...layer_names) {
     (register_layer(std::forward<decltype(layer_names)>(layer_names)), ...);
   }
 
+  /// Registers a layer with the given name for use with the ECS systems.
+  /// \param layer_name The name of the layer to register.
   void register_layer(const std::string &layer_name) {
     if (system_layers.contains(layer_name)) {
       log.warn("Attempted to register already-registered layer \"\"",
@@ -883,9 +1041,18 @@ public:
     system_layers.emplace(layer_name, detail::SystemLayer{});
   }
 
-  auto register_systems(std::optional<std::string> from,
-                        std::optional<std::string> to,
-                        detail::AnySystemFn auto &&...fn) {
+  /// Registers the given systems to run on a state transition. See
+  /// `Ecs::register_systems()` for details of a system.
+  /// \param from The state from which a transition should occur to run the
+  /// given systems, or `nullopt` to allow running on a transition from any
+  /// state.
+  /// \param to The state to which a transition should occur to run the given
+  /// systems, or `nullopt` to allow running on a transition to any state.
+  /// \param fn The systems to register.
+  /// \return An unlayered handle to modify some properties of the system.
+  auto register_systems_on_transition(std::optional<std::string> from,
+                                      std::optional<std::string> to,
+                                      detail::AnySystemFn auto &&...fn) {
     std::vector<std::string> layers;
 
     if (!from && !to) {
@@ -908,7 +1075,7 @@ public:
       layers.push_back("TransitionFrom" + *from + "To" + *to);
     }
 
-    detail::SystemHandle<false> handle;
+    SystemHandle<false> handle;
     for (const auto &layer : layers) {
       do_register_systems(layer, handle, std::forward<decltype(fn)>(fn)...);
     }
@@ -916,17 +1083,33 @@ public:
     return handle;
   }
 
+  /// Registers the given systems to run on the specified layer. A system is a
+  /// function that matches one of the following:
+  /// - An exclusive system: A function taking a reference to the `Ecs` as an
+  /// argument and nothing else. It is never run in parallel with any other
+  /// systems.
+  /// - A normal system: A function taking any unique combination of valid
+  /// system arguments. The system arguments may be the following:
+  ///   - `const Query<Ts...> &`
+  ///   - `Res<T>`
+  ///   - `Commands`
+  /// \param layer_name The name of the layer to register the systems on.
+  /// \param fn The systems to register.
+  /// \return A layered handle to modify properties of the system.
   auto register_systems(const std::string &layer_name,
                         detail::AnySystemFn auto &&...fn) {
     if (!system_layers.contains(layer_name)) {
       log.fatal("Attempted to access invalid layer \"{}\"", layer_name);
     }
 
-    detail::SystemHandle handle{system_layers.at(layer_name)};
+    SystemHandle handle{system_layers.at(layer_name)};
     do_register_systems(layer_name, handle, fn...);
     return handle;
   }
 
+  /// Prepare all systems for running. This MUST be called before any call to
+  /// `Ecs::run_systems()` and no systems should be registered after a call to
+  /// this.
   void prepare_systems() {
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -997,6 +1180,12 @@ public:
     log.info("prepare_systems done in {}", time);
   }
 
+  /// Runs the systems on the specified layer. If there is a state transition
+  /// queued, this also executes that first. That is, it recursively calls
+  /// itself with "TransitionFromAToB" if a state change is queued from A to B.
+  /// It also executes any queued commands at the end of the function. The
+  /// systems are run in parallel using the thread pool where possible.
+  /// \param layer_name The name of the layer to run.
   void run_systems(std::string layer_name) {
     if (state_changed && current_state != next_state) {
       state_changed = false;
@@ -1050,21 +1239,37 @@ public:
     run_commands();
   }
 
+  /// Runs any queued commands by the ECS. It is also automatically called at
+  /// the end of `Ecs::run_systems()`.
   void run_commands() {
     for (const auto &cmd : commands) { cmd(*this); }
     commands.clear();
   }
 
+  /// Constructs a query with the specified args.
+  /// \tparam QueryArgs... The arguments of the query.
+  /// \return The constructed query.
   template <detail::QueryArgs... Args> auto query() {
     return Query<Args...>{*this};
   }
 
-  auto get_all_entities() { return detail::EntityRange(*this); }
+  /// Returns a range which allows looping over all entities and also accessing
+  /// their components in a type-erased manner.
+  /// \return The entity range.
+  auto get_all_entities() { return EntityRange(*this); }
+
+  /// Returns a range which allows looping over all resources.
+  /// \return The resource range.
+  auto get_all_resources() {
+    return resources | std::views::transform([](const auto &pair) {
+             return std::make_pair(pair.first, pair.second.ptr.get());
+           });
+  }
 
 private:
   template <bool Layered>
   void do_register_systems(const std::string &layer_name,
-                           detail::SystemHandle<Layered> &handle,
+                           SystemHandle<Layered> &handle,
                            detail::AnySystemFn auto &&...fn) {
     if (!system_layers.contains(layer_name)) {
       log.fatal("Attempted to access invalid layer \"{}\"", layer_name);
@@ -1079,7 +1284,7 @@ private:
   template <bool Layered, typename... Args>
   void do_register_system(detail::SystemLayer &layer,
                           std::function<void(Args...)> &&fn, uint64_t id,
-                          detail::SystemHandle<Layered> &handle) {
+                          SystemHandle<Layered> &handle) {
     size_t index = layer.systems.size();
 
     auto dep_registerer = [&layer, id](std::type_index res_id, bool constant) {
@@ -1263,6 +1468,16 @@ private:
   std::mutex layer_mutex;
 };
 
+/// A `Query` is used to access any entities and requested component data
+/// represented by the template arguments of the query. The query arguments may
+/// be a unique mixture of the following:
+/// - `Entity` to get the entity ID of any matched entity in the query.
+/// - `T &` to require a component (`T` can and should be `const` where
+/// applicable).
+/// - `T *` to optionally get a component (`T` can and should be `const` where
+/// applicable).
+/// - `Filter<T>` where `Filter` may be one of `With`, 'Without', or `Has`.
+/// \tparam Ts... The arguments of the query.
 template <detail::QueryArgs... Ts> class Query {
   template <detail::QueryArg T> friend struct detail::GetQueryValue;
   friend struct Iterator;
@@ -1313,6 +1528,8 @@ template <detail::QueryArgs... Ts> class Query {
   };
 
 public:
+  /// Constructs a query with the given `Ecs` reference. It automatically gets
+  /// all data from the `Ecs` based on the query arguments.
   Query(Ecs &ecs) {
     detail::ArchetypeId include, exclude;
     (detail::SetIdValue<Ts>::set(ecs, include, exclude), ...);
@@ -1333,12 +1550,20 @@ public:
     }
   }
 
+  /// Gives an iterator to the start of the query data.
+  /// \return The begin iterator.
   Iterator begin() const { return Iterator{*this, 0, 0}; }
 
+  /// Gives an iterator to the one past the end of the query data.
+  /// \return The end iterator.
   Iterator end() const { return Iterator{*this, archetypes_count, 0}; }
 
+  /// Gives the number of entities matched by the query.
+  /// \return The total count of the query.
   size_t size() const { return total_count; }
 
+  /// Returns `*begin()` if the query has a single element, and throws a
+  /// `logic_error` otherwise.
   decltype(auto) single() const {
     if (total_count != 1) {
       throw std::logic_error(
@@ -1349,16 +1574,25 @@ public:
     return *begin();
   }
 
+  /// Executes a function for each element of the query, where the function
+  /// takes each query argument as a parameter.
+  /// \param f The function to invoke for each element.
   void for_each(std::invocable<Ts...> auto &&f) const {
     for (const auto &t : *this) { std::apply(f, t); }
   }
 
+  /// Executes a function for each element of the query, where the function
+  /// takes an index and each query argument as a parameter.
+  /// \param f The function to invoke for each element.
   void for_each(std::invocable<size_t, Ts...> auto &&f) const {
     for (size_t i = 0; const auto &t : *this) {
       std::apply(std::bind_front(f, i++), t);
     }
   }
 
+  /// Executes in parallel a function for each element of the query, where the
+  /// function takes an optional index and each query argument as a parameter.
+  /// \param f The function to invoke for each element.
   void parallel_for_each(auto &&f) const
       requires std::invocable<decltype(f), Ts...> ||
                std::invocable<decltype(f), size_t, Ts...> {
@@ -1405,6 +1639,9 @@ private:
   std::tuple<typename detail::QueryArgValueType<Ts>::Type...> values;
 };
 
+/// `Res` is used to access a resource in a system.
+/// \tparam T The resource to access. This can (and should) be `const` where
+/// applicable.
 template <typename T> struct Res {
   Res(Ecs &ecs) : value(ecs.get_resource<T>()) {}
 
@@ -1414,6 +1651,12 @@ template <typename T> struct Res {
   T *value;
 };
 
+/// `Commands` can be used in (or out of) a system to defer certain operations
+/// on the `Ecs`, which will be executed when `Ecs::run_commands()` or
+/// `Ecs::run_systems()` is called.
+/// Note that since this uses function callbacks, it is not very efficient. If a
+/// large number of such commands need to be done in a system, consider an
+/// exclusive system. See `Ecs::run_systems()` for detail.
 class Commands {
 public:
   Commands(Ecs &ecs) : ecs(ecs) {}
@@ -1460,11 +1703,12 @@ private:
   Ecs &ecs;
 };
 
+/// A condition to only run a system if in the given state.
+/// \param state The required state.
+/// \return The appropriate condition function.
 constexpr auto in_state(const std::string &state) {
   return [state](Ecs &ecs) { return ecs.get_state() == state; };
 };
-
-namespace detail {
 
 inline EntityRange::EntityRange(Ecs &ecs) : ecs(ecs) {
   for (const auto &archetype : ecs.archetypes) {
@@ -1495,6 +1739,8 @@ inline auto EntityHandle::get_components() {
 
   return v;
 }
+
+namespace detail {
 
 template <SystemArgs... Args>
 inline System<Args...>::System(std::function<void(Args...)> &&fn,
