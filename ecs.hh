@@ -1654,9 +1654,10 @@ template <typename T> struct Res {
 /// `Commands` can be used in (or out of) a system to defer certain operations
 /// on the `Ecs`, which will be executed when `Ecs::run_commands()` or
 /// `Ecs::run_systems()` is called.
-/// Note that since this uses function callbacks, it is not very efficient. If a
-/// large number of such commands need to be done in a system, consider an
-/// exclusive system. See `Ecs::run_systems()` for detail.
+/// Note that since this uses function callbacks, it is not very efficient. Only
+/// use this for a small number of commands. If a large number of such commands
+/// need to be done in a system, consider an exclusive system. See
+/// `Ecs::run_systems()` for detail.
 class Commands {
 public:
   Commands(Ecs &ecs) : ecs(ecs) {}
